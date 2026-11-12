@@ -2,8 +2,25 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { expect, it, describe } from "vitest"
+import { expect, it, describe, inject } from "vitest"
 import { FlowController, type SendToken } from "../src/streams.js"
+import { newWebSocketRpcSession } from "../src/index.js"
+import type { TestTarget } from "./test-util.js"
+
+it("closes an opted-in session after the last remote capability is released", async () => {
+  const socket = new WebSocket(`ws://${inject("testServerHost")}`);
+  const closed = new Promise<void>(resolve => socket.addEventListener("close", () => resolve(), { once: true }));
+  const client = newWebSocketRpcSession<TestTarget>(socket, undefined, { closeOnIdle: true });
+  try {
+    const counter = await client.makeCounter(10);
+    expect(await counter.increment(2)).toBe(12);
+    expect(socket.readyState).toBe(WebSocket.OPEN);
+    counter[Symbol.dispose]();
+    await closed;
+  } finally {
+    client[Symbol.dispose]();
+  }
+});
 
 // To emulate random-ish chunk sizes while keeping the test reproducible, we cycle through this
 // list of sizes.

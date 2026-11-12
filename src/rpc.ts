@@ -450,6 +450,9 @@ export type RpcSessionOptions = {
    */
   onSendError?: (error: Error) => Error | void;
 
+  /** Close a one-use client session after its calls, capabilities, and streams have drained. */
+  closeOnIdle?: boolean;
+
   /**
    * Overrides for the resource limits enforced while deserializing messages from the peer. Any
    * field left unset falls back to `DEFAULT_LIMITS`. These guard against resource-exhaustion
@@ -479,6 +482,8 @@ class RpcSessionImpl implements Importer, Exporter {
 
   // How many promises is our peer expecting us to resolve?
   private pullCount = 0;
+  private idleCheckQueued = false;
+  private idleCloseArmed = false;
 
   // Sparse array of onBrokenCallback registrations. Items are strictly appended to the end but
   // may be deleted from the middle (hence leaving the array sparse).
@@ -533,6 +538,19 @@ class RpcSessionImpl implements Importer, Exporter {
     this.abort(new Error("RPC session was shut down by disposing the main stub"), false);
   }
 
+  private checkIdle(): void {
+    if (!this.options.closeOnIdle || this.idleCheckQueued || this.abortReason !== undefined) return;
+    this.idleCheckQueued = true;
+    // Sends and releases update the tables synchronously before the microtask checks them.
+    queueMicrotask(() => {
+      this.idleCheckQueued = false;
+      if (this.abortReason !== undefined || !this.idleCloseArmed || this.pullCount !== 0) return;
+      if (Object.keys(this.imports).some(id => id !== "0") ||
+          Object.keys(this.exports).some(id => id !== "0")) return;
+      this.shutdown();
+    });
+  }
+
   exportStub(hook: StubHook): ExportId {
     if (this.abortReason) throw this.abortReason;
 
@@ -581,6 +599,7 @@ class RpcSessionImpl implements Importer, Exporter {
       delete this.exports[exportId];
       this.reverseExports.delete(entry.hook);
       entry.hook.dispose();
+      this.checkIdle();
     }
   }
 
@@ -652,6 +671,7 @@ class RpcSessionImpl implements Importer, Exporter {
           if (this.onBatchDone) {
             this.onBatchDone.resolve();
           }
+          this.checkIdle();
         }
       });
     }
@@ -734,6 +754,7 @@ class RpcSessionImpl implements Importer, Exporter {
   // Serializes and sends a message. Returns the byte length reported by the transport, or
   // undefined if the transport doesn't report size.
   private send(msg: any): number | undefined {
+    this.checkIdle();
     if (this.abortReason !== undefined) {
       // Ignore sends after we've aborted.
       return 0;
@@ -791,6 +812,7 @@ class RpcSessionImpl implements Importer, Exporter {
   }
 
   sendCall(id: ImportId, path: PropertyPath, args?: RpcPayload): RpcImportHook {
+    this.idleCloseArmed = true;
     if (this.abortReason) {
       args?.dispose();
       throw this.abortReason;
@@ -824,6 +846,7 @@ class RpcSessionImpl implements Importer, Exporter {
 
   sendStream(id: ImportId, path: PropertyPath, args: RpcPayload)
       : {promise: Promise<void>, size: number} {
+    this.idleCloseArmed = true;
     if (this.abortReason) {
       args.dispose();
       throw this.abortReason;
@@ -863,8 +886,8 @@ class RpcSessionImpl implements Importer, Exporter {
     // (Normally, sendRelease() cleans up the import table, but since remoteRefcount is 0, we
     // need to do it manually.)
     let promise = entry.awaitResolution().then(
-      p => { p.dispose(); delete this.imports[importId]; },
-      err => { delete this.imports[importId]; throw err; }
+      p => { p.dispose(); delete this.imports[importId]; this.checkIdle(); },
+      err => { delete this.imports[importId]; this.checkIdle(); throw err; }
     );
 
     return { promise, size };
@@ -872,6 +895,7 @@ class RpcSessionImpl implements Importer, Exporter {
 
   sendMap(id: ImportId, path: PropertyPath, captures: StubHook[], instructions: unknown[])
       : RpcImportHook {
+    this.idleCloseArmed = true;
     if (this.abortReason) {
       for (let cap of captures) {
         cap.dispose();
